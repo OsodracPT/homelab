@@ -5,6 +5,7 @@
 #   sudo ./homelab-harden.sh
 #   sudo ./homelab-harden.sh --ssh-port 2222
 #   sudo ./homelab-harden.sh --no-fail2ban --no-upgrades
+#   sudo ./homelab-harden.sh --skip-password   (if satoshi password already set)
 #
 # Fixed users: satoshi (admin), termix (bastion)
 # Public key:  YubiKey FIDO2 resident key (yubikey-homelab-202602)
@@ -26,6 +27,11 @@ BASTION_USER="termix"
 # Generated with: ssh-keygen -t ed25519-sk -O resident -O application=ssh:homelab
 YUBIKEY_PUBLIC_KEY="sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIL3e7JF8FjxaxgpP8ATHIjgY8KkBzhtFEDD8hCQW0B1/AAAAC3NzaDpob21lbGFi yubikey-homelab-202602"
 
+# YubiKey 2 FIDO2 resident key — backup hardware key
+# Generated with: ssh-keygen -t ed25519-sk -O resident -O application=ssh:homelab
+# Replace the placeholder below with your actual second YubiKey public key
+YUBIKEY2_PUBLIC_KEY=""  # ← paste yubikey2_homelab.pub contents here
+
 # ed25519 key — for termix bastion container (no passphrase, stored as Docker secret)
 TERMIX_PUBLIC_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJxtDvFjvEyys0O3bDW6xcjKA54osftDHFKsS53XEhAd termix-bastion-202602"
 
@@ -33,13 +39,15 @@ TERMIX_PUBLIC_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJxtDvFjvEyys0O3bDW6xcjKA
 SSH_PORT=22
 INSTALL_FAIL2BAN=true
 INSTALL_UNATTENDED_UPGRADES=true
+SKIP_PASSWORD=false
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --ssh-port)       SSH_PORT="$2";      shift 2 ;;
-    --no-fail2ban)    INSTALL_FAIL2BAN=false;            shift ;;
-    --no-upgrades)    INSTALL_UNATTENDED_UPGRADES=false; shift ;;
+    --ssh-port)        SSH_PORT="$2";      shift 2 ;;
+    --no-fail2ban)     INSTALL_FAIL2BAN=false;            shift ;;
+    --no-upgrades)     INSTALL_UNATTENDED_UPGRADES=false; shift ;;
+    --skip-password)   SKIP_PASSWORD=true;                shift ;;
     *) error "Unknown argument: $1" ;;
   esac
 done
@@ -78,9 +86,31 @@ else
   info "User $ADMIN_USER already exists — ensured sudo membership"
 fi
 
-# Lock root password (force use of sudo)
-passwd -l root
-info "Root password locked"
+# Set satoshi password — required for sudo (will prompt interactively)
+# If already set and you want to keep it, press Ctrl+C and re-run with --skip-password
+if [[ "$SKIP_PASSWORD" != "true" ]]; then
+  # Check if satoshi already has a password set
+  if passwd -S "$ADMIN_USER" 2>/dev/null | grep -q " NP "; then
+    info "Setting password for $ADMIN_USER (required for sudo)..."
+    until passwd "$ADMIN_USER"; do
+      warn "Passwords did not match or were too weak — try again"
+    done
+  else
+    info "Password already set for $ADMIN_USER — skipping"
+  fi
+fi
+
+# Set root password for emergency console access via Proxmox
+# Root SSH login remains disabled — this is console-only recovery
+# If root already has a password set, skip to avoid overwriting it
+if passwd -S root 2>/dev/null | grep -q " NP \| L "; then
+  info "Setting root password for emergency Proxmox console access..."
+  until passwd root; do
+    warn "Passwords did not match or were too weak — try again"
+  done
+else
+  info "Root password already set — skipping"
+fi
 
 # ─── 4. Create bastion user: termix ──────────────────────────────────────────
 info "Ensuring bastion user: $BASTION_USER"
@@ -118,6 +148,14 @@ install_pubkey "$ADMIN_USER"   "$TERMIX_PUBLIC_KEY"
 install_pubkey "$BASTION_USER" "$YUBIKEY_PUBLIC_KEY"
 install_pubkey "$BASTION_USER" "$TERMIX_PUBLIC_KEY"
 
+# Install second YubiKey if configured
+if [[ -n "$YUBIKEY2_PUBLIC_KEY" ]]; then
+  install_pubkey "$ADMIN_USER"   "$YUBIKEY2_PUBLIC_KEY"
+  install_pubkey "$BASTION_USER" "$YUBIKEY2_PUBLIC_KEY"
+else
+  warn "YUBIKEY2_PUBLIC_KEY not set — skipping second YubiKey (add it to the script when ready)"
+fi
+
 # ─── 6. Sudo configuration ────────────────────────────────────────────────────
 info "Configuring sudoers..."
 SUDOERS_DROP="/etc/sudoers.d/99-homelab"
@@ -128,9 +166,8 @@ cat > "$SUDOERS_DROP" <<EOF
 # satoshi — full sudo with password
 %sudo ALL=(ALL:ALL) ALL
 
-# termix — bastion user, limited sudo (passwordless for specific ops if needed)
-# Grant full sudo here; restrict further if your threat model requires it
-$BASTION_USER ALL=(ALL:ALL) ALL
+# termix — bastion container user, passwordless sudo (no interactive password available)
+$BASTION_USER ALL=(ALL:ALL) NOPASSWD: ALL
 
 # Audit and timeout settings
 Defaults timestamp_timeout=15
