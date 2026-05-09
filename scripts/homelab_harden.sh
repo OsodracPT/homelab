@@ -259,12 +259,48 @@ fi
 # ─── 9. Unattended upgrades ───────────────────────────────────────────────────
 if $INSTALL_UNATTENDED_UPGRADES; then
   info "Enabling unattended security upgrades..."
+
+  # Schedule: refresh lists daily, run unattended-upgrade daily, autoclean weekly
   cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
+
+  # Policy: Debian security + stable-updates only.
+  # On Proxmox, blacklist PVE/Ceph packages so kernel/PVE upgrades stay manual
+  # (they often require host reboots and can interact with running VMs).
+  # On plain Debian the blacklist patterns simply don't match anything.
+  cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'EOF'
+// Managed by homelab-harden.sh — do not edit manually
+
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Debian,codename=${distro_codename}-updates";
+};
+
+// Belt-and-suspenders: never auto-upgrade Proxmox VE / Ceph packages.
+Unattended-Upgrade::Package-Blacklist {
+    "proxmox-kernel-.*";
+    "pve-kernel-.*";
+    "pve-manager";
+    "proxmox-ve";
+    "ceph";
+    "ceph-.*";
+};
+
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+
   systemctl enable --now unattended-upgrades
+
+  # Validate the policy parses — bad syntax would silently disable upgrades
+  if ! unattended-upgrade --dry-run --debug >/dev/null 2>&1; then
+    warn "unattended-upgrade dry-run failed — review /etc/apt/apt.conf.d/50unattended-upgrades"
+  fi
 fi
 
 # ─── 10. SSH login banner ─────────────────────────────────────────────────────
